@@ -18,6 +18,7 @@ type RpcClient struct {
 }
 //
 var ErrorCallTimeout error = errors.New("call timeout.")
+
 //
 func Open(url ,exchange string) (*RpcClient, error) {
 	var err error
@@ -31,6 +32,11 @@ func Open(url ,exchange string) (*RpcClient, error) {
 	}
 	err = rc.exchangeDeclare(exchange,"")
 	return rc, err
+}
+
+//
+func (c *RpcClient) SetTimeout(t time.Duration){
+	c.timeout = t
 }
 
 //
