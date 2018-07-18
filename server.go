@@ -9,11 +9,20 @@ import (
 	"reflect"
 	"fmt"
 )
+
+type RpcMode string
+
+//
+const (
+	MODE_BALANCED  RpcMode = "balanced"
+	MODE_BROADCAST RpcMode = "broadcast"
+)
+
 //
 type rpcEntity struct {
-	rpcServer  *RpcServer
-	queue      *amqp.Queue
-	method     interface{}
+	rpcServer *RpcServer
+	queue     *amqp.Queue
+	method    interface{}
 }
 
 type RpcServer struct {
@@ -24,14 +33,16 @@ type RpcServer struct {
 	cancel   func()
 	group    *sync.WaitGroup
 	exchange string
+	mode     RpcMode
 }
 
 //amqp://guest:guest@localhost:5672/
-func NewRpcServer(url ,exchange string) (*RpcServer, error) {
+func NewRpcServer(url, exchange string) (*RpcServer, error) {
 	var err error
 	rs := &RpcServer{
 		rpcMap: make(map[string]*rpcEntity),
 		group:  new(sync.WaitGroup),
+		mode:   MODE_BALANCED,
 	}
 	rs.mContext, rs.cancel = context.WithCancel(context.Background())
 	rs.conn, err = amqp.Dial(url)
@@ -42,24 +53,38 @@ func NewRpcServer(url ,exchange string) (*RpcServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = rs.channel.Qos(10,0, false)
+	err = rs.channel.Qos(10, 0, false)
 	if err != nil {
 		return nil, err
 	}
-	err = rs.exchangeDeclare(exchange,"")
+	err = rs.exchangeDeclare(exchange, "")
 	return rs, err
 }
 
+//
+func (s *RpcServer) SetMode(mode RpcMode) {
+	s.mode = mode
+}
+
 //func(argus ...interface{}) error
-func (s *RpcServer) Register(method string, call interface{}) error {
+func (s *RpcServer) Register(method string, call interface{}) (err error) {
 	val := reflect.ValueOf(call)
-	if val.Type().Kind() != reflect.Func{
+	if val.Type().Kind() != reflect.Func {
 		return fmt.Errorf("the call must be func.")
 	}
-	mQueue, err := s.channel.QueueDeclare("", false, true, false, false, nil)
-	if err != nil {
-		return err
+	var mQueue amqp.Queue
+	if s.mode == MODE_BROADCAST {
+		mQueue, err = s.channel.QueueDeclare("", false, true, false, false, nil)
+		if err != nil {
+			return err
+		}
+	}else{
+		mQueue, err = s.channel.QueueDeclare(method, false, true, false, false, nil)
+		if err != nil {
+			return err
+		}
 	}
+	//
 	entity := &rpcEntity{queue: &mQueue, method: call, rpcServer: s}
 	s.rpcMap[method] = entity
 	err = s.channel.QueueBind(mQueue.Name, method, s.exchange, false, nil)
@@ -131,7 +156,7 @@ func (re *rpcEntity) run() {
 		result, err := re.callMethod(argus...)
 		if err != nil {
 			log.Println(err)
-		}else {
+		} else {
 			responseData, err = json.Marshal(result)
 			if err != nil {
 				log.Println(err)
@@ -151,44 +176,45 @@ func (re *rpcEntity) run() {
 		}
 	}
 }
+
 //
-func (re *rpcEntity) callMethod(param ...interface{}) (response interface{},err error){
-	defer func(){
+func (re *rpcEntity) callMethod(param ...interface{}) (response interface{}, err error) {
+	defer func() {
 		if recoverErr := recover(); recoverErr != nil {
-			err = fmt.Errorf(fmt.Sprintf("%v",recoverErr))
+			err = fmt.Errorf(fmt.Sprintf("%v", recoverErr))
 		}
 	}()
 	//
 	val := reflect.ValueOf(re.method)
-	if val.Type().Kind() != reflect.Func{
-		return nil,fmt.Errorf("the call must be func.")
+	if val.Type().Kind() != reflect.Func {
+		return nil, fmt.Errorf("the call must be func.")
 	}
 	//
 	numIn := val.Type().NumIn()
 	argus := getValues(param...)
-	if len(argus) < numIn{
-		return nil,fmt.Errorf("the param count not enough %d",numIn)
+	if len(argus) < numIn {
+		return nil, fmt.Errorf("the param count not enough %d", numIn)
 	}
 	var reVals []reflect.Value
-	if val.Type().IsVariadic(){
+	if val.Type().IsVariadic() {
 		reVals = val.Call(argus)
-	}else{
+	} else {
 		reVals = val.Call(argus[:numIn])
 	}
-	if len(reVals) > 0{
-		if len(reVals) > 1{
-			if err,ok := reVals[1].Interface().(error);ok{
-				return reVals[0].Interface(),err
+	if len(reVals) > 0 {
+		if len(reVals) > 1 {
+			if err, ok := reVals[1].Interface().(error); ok {
+				return reVals[0].Interface(), err
 			}
 		}
-		return reVals[0].Interface(),nil
+		return reVals[0].Interface(), nil
 	}
-	return nil,nil
+	return nil, nil
 }
 func getValues(param ...interface{}) []reflect.Value {
-	vals := make([]reflect.Value,0,len(param))
+	vals := make([]reflect.Value, 0, len(param))
 	for i := range param {
-		vals = append(vals,reflect.ValueOf(param[i]))
+		vals = append(vals, reflect.ValueOf(param[i]))
 	}
 	return vals
 }
