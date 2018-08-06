@@ -185,21 +185,31 @@ func (re *rpcEntity) callMethod(param ...interface{}) (response interface{}, err
 		}
 	}()
 	//
-	val := reflect.ValueOf(re.method)
-	if val.Type().Kind() != reflect.Func {
+	valMethod := reflect.ValueOf(re.method)
+	if valMethod.Type().Kind() != reflect.Func {
 		return nil, fmt.Errorf("the call must be func.")
 	}
 	//
-	numIn := val.Type().NumIn()
-	argus := getValues(param...)
+	numIn := valMethod.Type().NumIn()
+	//
+	var argsTypes []reflect.Type
+	for i:=0;i<numIn;i++{
+		argsTypes = append(argsTypes,valMethod.Type().In(i))
+	}
+	argus,err := getValues(argsTypes,param...)
+	if err != nil{
+		return nil,err
+	}
+	//
 	if len(argus) < numIn {
 		return nil, fmt.Errorf("the param count not enough %d", numIn)
 	}
 	var reVals []reflect.Value
-	if val.Type().IsVariadic() {
-		reVals = val.Call(argus)
+	//可变参数
+	if valMethod.Type().IsVariadic() {
+		reVals = valMethod.Call(argus)
 	} else {
-		reVals = val.Call(argus[:numIn])
+		reVals = valMethod.Call(argus[:numIn])
 	}
 	if len(reVals) > 0 {
 		if len(reVals) > 1 {
@@ -211,10 +221,21 @@ func (re *rpcEntity) callMethod(param ...interface{}) (response interface{}, err
 	}
 	return nil, nil
 }
-func getValues(param ...interface{}) []reflect.Value {
-	vals := make([]reflect.Value, 0, len(param))
-	for i := range param {
-		vals = append(vals, reflect.ValueOf(param[i]))
+//
+func getValues(types []reflect.Type,param ...interface{}) (vals []reflect.Value, err error) {
+	defer func() {
+		if recoverErr := recover(); recoverErr != nil {
+			err = fmt.Errorf(fmt.Sprintf("%v", recoverErr))
+		}
+	}()
+	if len(param) < len(types){
+		return nil,fmt.Errorf("the param count not enough %d", len(types))
 	}
-	return vals
+	vals = make([]reflect.Value, 0, len(param))
+	for i,p := range param {
+		val := reflect.ValueOf(p)
+		val = val.Convert(types[i])
+		vals = append(vals, val)
+	}
+	return vals,nil
 }
