@@ -149,15 +149,15 @@ func (c *RpcClient) Close() {
 }
 
 //
-func (c *RpcClient) Call(method string, argus ...interface{}) (interface{}, error) {
+func (c *RpcClient) Call(method string,reV interface{}, argus ...interface{}) (error) {
 	requestData, err := json.Marshal(argus)
 	if err != nil {
-		return nil, err
+		return  err
 	}
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
 	ch, err := c.getChannel()
 	if err != nil {
-		return nil, err
+		return  err
 	}
 	defer c.releaseChannel(ch)
 	//
@@ -169,13 +169,13 @@ func (c *RpcClient) Call(method string, argus ...interface{}) (interface{}, erro
 		MessageId:   id,
 	})
 	if err != nil {
-		return nil, err
+		return  err
 	}
 	//
 	if ch.delivery == nil {
 		ch.delivery, err = ch.channel.Consume(ch.queue.Name, "", false, false, false, false, nil)
 		if err != nil {
-			return nil, err
+			return  err
 		}
 	}
 	//
@@ -187,18 +187,18 @@ func (c *RpcClient) Call(method string, argus ...interface{}) (interface{}, erro
 				continue
 			}
 			msg.Ack(false)
-			var data interface{}
+			//var data interface{}
 			if len(msg.Body) < 1 {
-				return nil, err
+				return  err
 			}
-			err = json.Unmarshal(msg.Body, &data)
+			err = json.Unmarshal(msg.Body, &reV)
 			if err != nil {
-				return nil, err
+				return  err
 			}
-			return data, nil
+			return  nil
 		case <-time.After(c.timeout):
-			return nil, ErrorCallTimeout
+			return  ErrorCallTimeout
 		}
 	}
-	return nil, nil
+	return  nil
 }
