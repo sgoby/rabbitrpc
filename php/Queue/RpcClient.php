@@ -13,7 +13,6 @@ class RpcClient extends RabbitMQ{
 
     private static $instance;
     private $clientQueue;
-    private $clientQueueName = "rpcqueue";
     //
     public static function getInstance(){
         if(self::$instance == null){
@@ -34,12 +33,10 @@ class RpcClient extends RabbitMQ{
             'connect_timeout' => 10,
         );
         $this->connect($conf);
-        $this->clientQueueName = $this->clientQueueName.".".uniqid();
         $this->clientQueue = new AMQPQueue($this->channel);
-        $this->clientQueue->setName($this->clientQueueName);
         $this->clientQueue->setFlags(AMQP_AUTODELETE);
         $this->clientQueue->declareQueue();
-        $this->clientQueue->bind($this->exchange->getName(),$this->clientQueueName);
+        $this->clientQueue->bind($this->exchange->getName(),$this->clientQueue->getName());
     }
     //
     public function callRPC($method,...$args){
@@ -50,7 +47,8 @@ class RpcClient extends RabbitMQ{
         $msgId = uniqid();
         $attributes = array(
             "message_id" => $msgId,
-            "reply_to" => $this->clientQueueName
+            "reply_to" => $this->clientQueue->getName(),
+            "expiration" => 10000
         );
         //
         if($this->exchange->publish(json_encode($args),$method,AMQP_NOPARAM,$attributes) == false){
