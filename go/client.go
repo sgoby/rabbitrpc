@@ -7,14 +7,13 @@ import (
 	"time"
 	"errors"
 	"sync"
-	"container/list"
 )
 
 type RpcClient struct {
 	conn        *amqp.Connection
 	exchange    string
 	timeout     time.Duration
-	channelPool *list.List
+	channelPool []*RpcChannel //chan *RpcChannel//  *list.List
 	mu          *sync.Mutex
 	maxOpen     int
 	maxIdle     int
@@ -38,14 +37,26 @@ func Open(url, exchange string) (*RpcClient, error) {
 	var err error
 	rc := &RpcClient{
 		timeout:     time.Second * 10,
-		channelPool: list.New(),
+		channelPool: make([]*RpcChannel,0,1000),//list.New(),
 		mu:          new(sync.Mutex),
 		exchange:    exchange,
-		maxOpen:     500,
+		maxOpen:     1000,
 		maxIdle:     100,
-		maxIdleTime: 10,
+		maxIdleTime: 1800,
 	}
+	//
 	rc.conn, err = amqp.Dial(url)
+	if err != nil{
+		return nil,err
+	}
+	for i:= 0;i<=100;i++{
+		ch ,err := rc.newChannel()
+		if err != nil{
+			return rc, err
+		}
+		rc.channelPool = append(rc.channelPool,ch)
+	}
+	go rc.releaseIdleChannel()
 	return rc, err
 }
 
@@ -58,46 +69,69 @@ func (c *RpcClient) SetMaxOpenConns(n int) {
 	c.maxOpen = n
 }
 
+func (c *RpcClient) releaseIdleChannel() {
+	for{
+		select {
+		case <-time.After(c.timeout):
+			c.releaseIdleChannelDC()
+		}
+	}
+}
+//
+func (c *RpcClient) releaseIdleChannelDC() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	//
+	if len(c.channelPool) > 0 {
+		for i:= 0 ;i< len(c.channelPool);i++{
+			ch := c.channelPool[0]
+			if ch != nil {
+				if time.Now().Unix()-ch.idleBegin.Unix() < c.maxIdleTime {
+					break
+				}
+				ch.channel.Close()
+				numFree := len(c.channelPool)
+				copy(c.channelPool[0:], c.channelPool[1:])
+				c.channelPool = c.channelPool[:numFree-1]
+			}
+		}
+	}
+}
 //
 func (c *RpcClient) releaseChannel(ch *RpcChannel) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if ch != nil {
-		defer func() { c.countOpen -= 1 }()
-		if ch.isTemp || c.channelPool.Len() > c.maxOpen {
+		if ch.isTemp || len(c.channelPool) > c.maxOpen {
 			ch.channel.Close()
 			return
 		}
 		ch.idleBegin = time.Now()
-		c.channelPool.PushBack(ch)
+		c.channelPool = append(c.channelPool,ch)
 	}
 }
-
 //
 func (c *RpcClient) getChannel() (ch *RpcChannel,err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var element *list.Element
-	for {
-		if c.channelPool.Len() < 1 {
-			break;
-		}
-		element = c.channelPool.Front()
-		c.channelPool.Remove(element)
-		if element != nil {
-			ch = element.Value.(*RpcChannel)
-			if time.Now().Unix()-ch.idleBegin.Unix() > c.maxIdleTime {
-				ch.channel.Close()
-				element = nil
+	if len(c.channelPool) > 0 {
+		lens := len(c.channelPool)
+		for i:= 0 ;i< lens;i++{
+			//
+			ch = c.channelPool[0]
+			numFree := len(c.channelPool)
+			copy(c.channelPool, c.channelPool[1:])
+			c.channelPool = c.channelPool[:numFree-1]
+			//
+			if ch == nil{
 				continue
 			}
-			break
+			if time.Now().Unix()-ch.idleBegin.Unix() > c.maxIdleTime {
+				ch.channel.Close()
+				continue
+			}
+			return ch,nil
 		}
-	}
-	//
-	if element != nil && element.Value != nil {
-		c.countOpen += 1
-		return ch, nil
 	}
 	ch, err = c.newChannel()
 	if err != nil {
@@ -110,38 +144,40 @@ func (c *RpcClient) getChannel() (ch *RpcChannel,err error) {
 }
 
 //
-func (c *RpcClient) newChannel() (*RpcChannel, error) {
+func (c *RpcClient) newChannel() (*RpcChannel,error) {
 	ch, err := c.conn.Channel()
 	if err != nil {
-		return nil, err
+		return nil,err
 	}
 	err = ch.ExchangeDeclare(c.exchange, "direct", true, false, false, true, nil)
 	if err != nil {
-		return nil, err
+		return nil,err
 	}
 	mQueue, err := ch.QueueDeclare("", false, true, false, false, nil)
 	if err != nil {
-		return nil, err
+		return nil,err
 	}
 	//
 	err = ch.QueueBind(mQueue.Name, mQueue.Name, c.exchange, false, nil)
 	if err != nil {
-		return nil, err
+		return nil,err
 	}
-	return &RpcChannel{channel: ch, queue: &mQueue}, nil
+	//
+	mDelivery, err := ch.Consume(mQueue.Name, "", true, false, false, false, nil)
+	if err != nil {
+		return  nil,err
+	}
+	return &RpcChannel{channel: ch, queue: &mQueue,delivery:mDelivery,idleBegin:time.Now()},nil
 }
 
 //
 func (c *RpcClient) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for {
-		element := c.channelPool.Front()
-		if element == nil {
-			break
+	for _,ch := range  c.channelPool{
+		if ch != nil{
+			ch.channel.Close()
 		}
-		ch := element.Value.(*RpcChannel)
-		ch.channel.Close()
 	}
 	if c.conn != nil {
 		c.conn.Close()
@@ -172,13 +208,6 @@ func (c *RpcClient) Call(method string,reV interface{}, argus ...interface{}) (e
 		return  err
 	}
 	//
-	if ch.delivery == nil {
-		ch.delivery, err = ch.channel.Consume(ch.queue.Name, "", false, false, false, false, nil)
-		if err != nil {
-			return  err
-		}
-	}
-	//
 	for {
 		select {
 		case msg := <-ch.delivery:
@@ -186,7 +215,7 @@ func (c *RpcClient) Call(method string,reV interface{}, argus ...interface{}) (e
 				msg.Nack(false, true)
 				continue
 			}
-			msg.Ack(false)
+			//msg.Ack(false)
 			//var data interface{}
 			if len(msg.Body) < 1 {
 				return  err

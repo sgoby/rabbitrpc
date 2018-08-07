@@ -19,45 +19,41 @@ const (
 )
 
 //
-type rpcEntity struct {
+type rpcMethod struct {
 	rpcServer *RpcServer
 	queue     *amqp.Queue
 	method    interface{}
+	channel   *amqp.Channel
+	mContext  context.Context
+	cancel    func()
 }
 
 type RpcServer struct {
 	conn     *amqp.Connection
-	channel  *amqp.Channel
-	rpcMap   map[string]*rpcEntity
+	rpcMap   map[string]*rpcMethod
 	mContext context.Context
 	cancel   func()
 	group    *sync.WaitGroup
 	exchange string
 	mode     RpcMode
+	onRun    bool
+
 }
 
 //amqp://guest:guest@localhost:5672/
 func NewRpcServer(url, exchange string) (*RpcServer, error) {
 	var err error
 	rs := &RpcServer{
-		rpcMap: make(map[string]*rpcEntity),
+		rpcMap: make(map[string]*rpcMethod),
 		group:  new(sync.WaitGroup),
 		mode:   MODE_BALANCED,
+		exchange: exchange,
 	}
 	rs.mContext, rs.cancel = context.WithCancel(context.Background())
 	rs.conn, err = amqp.Dial(url)
 	if err != nil {
 		return nil, err
 	}
-	rs.channel, err = rs.conn.Channel()
-	if err != nil {
-		return nil, err
-	}
-	err = rs.channel.Qos(10, 0, false)
-	if err != nil {
-		return nil, err
-	}
-	err = rs.exchangeDeclare(exchange, "")
 	return rs, err
 }
 
@@ -72,43 +68,70 @@ func (s *RpcServer) Register(method string, call interface{}) (err error) {
 	if val.Type().Kind() != reflect.Func {
 		return fmt.Errorf("the call must be func.")
 	}
-	var mQueue amqp.Queue
-	if s.mode == MODE_BROADCAST {
-		mQueue, err = s.channel.QueueDeclare("", false, true, false, false, nil)
-		if err != nil {
-			return err
-		}
-	}else{
-		mQueue, err = s.channel.QueueDeclare(method, false, true, false, false, nil)
-		if err != nil {
-			return err
-		}
-	}
-	//
-	entity := &rpcEntity{queue: &mQueue, method: call, rpcServer: s}
-	s.rpcMap[method] = entity
-	err = s.channel.QueueBind(mQueue.Name, method, s.exchange, false, nil)
+	rm, err := s.newRpcMethod(method)
 	if err != nil {
 		return err
+	}
+	rm.method = call
+	s.rpcMap[method] = rm
+	if s.isRun(){
+		s.group.Add(1)
+		go rm.run()
 	}
 	return nil
 }
 
-//mqbool,fanout[direct | topic]
-func (s *RpcServer) exchangeDeclare(name, kind string) error {
-	if len(kind) <= 0 {
-		kind = "direct"
+//
+func (s *RpcServer) newRpcMethod(method string) (*rpcMethod, error) {
+	ch, err := s.conn.Channel()
+	if err != nil {
+		return nil, err
 	}
-	s.exchange = name
-	return s.channel.ExchangeDeclare(name, kind, true, false, false, true, nil)
+	err = ch.Qos(10, 0, false)
+	if err != nil {
+		ch.Close()
+		return nil, err
+	}
+	err = ch.ExchangeDeclare(s.exchange, "direct", true, false, false, true, nil)
+	if err != nil {
+		ch.Close()
+		return nil, err
+	}
+	//
+	var mQueue amqp.Queue
+	if s.mode == MODE_BROADCAST {
+		mQueue, err = ch.QueueDeclare("", false, true, false, false, nil)
+		if err != nil {
+			ch.Close()
+			return nil, err
+		}
+	} else {
+		mQueue, err = ch.QueueDeclare(method, false, true, false, false, nil)
+		if err != nil {
+			ch.Close()
+			return nil, err
+		}
+	}
+	err = ch.QueueBind(mQueue.Name, method, s.exchange, false, nil)
+	if err != nil {
+		ch.Close()
+		return nil, err
+	}
+	rm := &rpcMethod{queue: &mQueue, rpcServer: s, channel: ch}
+	rm.mContext, rm.cancel = context.WithCancel(s.mContext)
+	return rm, nil
 }
-
+func (s *RpcServer) isRun() bool {
+	return s.onRun
+}
 //
 func (s *RpcServer) Run() {
-	for _, entity := range s.rpcMap {
+	s.group.Add(1)
+	for _, rm := range s.rpcMap {
 		s.group.Add(1)
-		go entity.run()
+		go rm.run()
 	}
+	s.onRun = true
 	s.group.Wait()
 }
 
@@ -117,29 +140,42 @@ func (s *RpcServer) Close() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	if s.channel != nil {
-		s.channel.Close()
+	//
+	for _, rm := range s.rpcMap {
+		if rm != nil{
+			rm.close()
+		}
 	}
+	s.group.Done()
+	//
 	if s.conn != nil {
 		s.conn.Close()
 	}
 }
-
 //
-func (re *rpcEntity) run() {
+func (re *rpcMethod) close() {
+	if re.cancel != nil {
+		re.cancel()
+	}
+	if re.channel != nil {
+		re.channel.Close()
+	}
+}
+//
+func (re *rpcMethod) run() {
 	if re != nil && re.rpcServer != nil {
 		defer re.rpcServer.group.Done()
 	}
 	log.Println(re.queue.Name)
 	//re.queue.Name
-	msgs, err := re.rpcServer.channel.Consume(re.queue.Name, "", false, false, false, false, nil)
+	msgs, err := re.channel.Consume(re.queue.Name, "", false, false, false, false, nil)
 	if err != nil {
 		return
 	}
 	//defer close(msgs)
 	for msg := range msgs {
 		select {
-		case <-re.rpcServer.mContext.Done():
+		case <-re.mContext.Done():
 			return
 		default:
 		}
@@ -163,7 +199,7 @@ func (re *rpcEntity) run() {
 			}
 		}
 		//
-		err = re.rpcServer.channel.Publish(re.rpcServer.exchange, msg.ReplyTo, false, false, amqp.Publishing{
+		err = re.channel.Publish(re.rpcServer.exchange, msg.ReplyTo, false, false, amqp.Publishing{
 			ContentType:   "text/plain",
 			CorrelationId: msg.CorrelationId,
 			Body:          responseData,
@@ -178,7 +214,7 @@ func (re *rpcEntity) run() {
 }
 
 //
-func (re *rpcEntity) callMethod(param ...interface{}) (response interface{}, err error) {
+func (re *rpcMethod) callMethod(param ...interface{}) (response interface{}, err error) {
 	defer func() {
 		if recoverErr := recover(); recoverErr != nil {
 			err = fmt.Errorf(fmt.Sprintf("%v", recoverErr))
@@ -193,12 +229,12 @@ func (re *rpcEntity) callMethod(param ...interface{}) (response interface{}, err
 	numIn := valMethod.Type().NumIn()
 	//
 	var argsTypes []reflect.Type
-	for i:=0;i<numIn;i++{
-		argsTypes = append(argsTypes,valMethod.Type().In(i))
+	for i := 0; i < numIn; i++ {
+		argsTypes = append(argsTypes, valMethod.Type().In(i))
 	}
-	argus,err := getValues(argsTypes,param...)
-	if err != nil{
-		return nil,err
+	argus, err := getValues(argsTypes, param...)
+	if err != nil {
+		return nil, err
 	}
 	//
 	if len(argus) < numIn {
@@ -221,21 +257,22 @@ func (re *rpcEntity) callMethod(param ...interface{}) (response interface{}, err
 	}
 	return nil, nil
 }
+
 //
-func getValues(types []reflect.Type,param ...interface{}) (vals []reflect.Value, err error) {
+func getValues(types []reflect.Type, param ...interface{}) (vals []reflect.Value, err error) {
 	defer func() {
 		if recoverErr := recover(); recoverErr != nil {
 			err = fmt.Errorf(fmt.Sprintf("%v", recoverErr))
 		}
 	}()
-	if len(param) < len(types){
-		return nil,fmt.Errorf("the param count not enough %d", len(types))
+	if len(param) < len(types) {
+		return nil, fmt.Errorf("the param count not enough %d", len(types))
 	}
 	vals = make([]reflect.Value, 0, len(param))
-	for i,p := range param {
+	for i, p := range param {
 		val := reflect.ValueOf(p)
 		val = val.Convert(types[i])
 		vals = append(vals, val)
 	}
-	return vals,nil
+	return vals, nil
 }
