@@ -178,7 +178,7 @@ func (c *RpcClient) Close() {
 	defer c.mu.Unlock()
 	for _,ch := range  c.channelPool{
 		if ch != nil{
-			ch.channel.Close()
+			ch.close(c.exchange)
 		}
 	}
 	if c.conn != nil {
@@ -186,6 +186,16 @@ func (c *RpcClient) Close() {
 	}
 }
 
+//
+func (ch *RpcChannel) close(exchange string){
+	if ch.channel != nil && ch.queue != nil{
+		ch.channel.QueueUnbind(ch.queue.Name,ch.queue.Name,exchange,nil)
+		ch.channel.QueueDelete(ch.queue.Name,true,true,true)
+	}
+	if ch.channel != nil{
+		ch.channel.Close()
+	}
+}
 //
 func (c *RpcClient) Call(method string,reV interface{}, argus ...interface{}) (error) {
 	requestData, err := json.Marshal(argus)
