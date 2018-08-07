@@ -7,6 +7,7 @@ import (
 	"time"
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 type RpcClient struct {
@@ -19,6 +20,7 @@ type RpcClient struct {
 	maxIdle     int
 	maxIdleTime int64
 	countOpen   int
+	serialNo    uint64
 }
 
 //
@@ -42,7 +44,7 @@ func Open(url, exchange string) (*RpcClient, error) {
 		exchange:    exchange,
 		maxOpen:     1000,
 		maxIdle:     100,
-		maxIdleTime: 1800,
+		maxIdleTime: 120,
 	}
 	//
 	rc.conn, err = amqp.Dial(url)
@@ -190,7 +192,7 @@ func (c *RpcClient) Call(method string,reV interface{}, argus ...interface{}) (e
 	if err != nil {
 		return  err
 	}
-	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	id := fmt.Sprintf("NO%d",atomic.AddUint64(&c.serialNo,1))
 	ch, err := c.getChannel()
 	if err != nil {
 		return  err
