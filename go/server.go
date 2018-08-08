@@ -315,8 +315,14 @@ func getValues(types []reflect.Type, param ...interface{}) (vals []reflect.Value
 		return nil, fmt.Errorf("the param count not enough %d", len(types))
 	}
 	vals = make([]reflect.Value, 0, len(param))
+	hasVariadic := false
 	for i, p := range param {
 		val := reflect.ValueOf(p)
+		if types[i].IsVariadic() || hasVariadic{
+			vals = append(vals, val)
+			hasVariadic = true
+			continue
+		}
 		val = val.Convert(types[i])
 		vals = append(vals, val)
 	}
