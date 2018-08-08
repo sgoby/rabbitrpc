@@ -8,6 +8,7 @@ import (
 	"log"
 	"reflect"
 	"fmt"
+	"time"
 )
 
 type RpcMode string
@@ -29,32 +30,64 @@ type rpcMethod struct {
 }
 
 type RpcServer struct {
-	conn     *amqp.Connection
-	rpcMap   map[string]*rpcMethod
-	mContext context.Context
-	cancel   func()
-	group    *sync.WaitGroup
-	exchange string
-	mode     RpcMode
-	onRun    bool
-
+	conn         *amqp.Connection
+	rpcMap       map[string]*rpcMethod
+	mContext     context.Context
+	cancel       func()
+	group        *sync.WaitGroup
+	exchange     string
+	mode         RpcMode
+	onRun        bool
+	notifyClosed chan *amqp.Error
+	url          string
 }
 
 //amqp://guest:guest@localhost:5672/
 func NewRpcServer(url, exchange string) (*RpcServer, error) {
 	var err error
 	rs := &RpcServer{
-		rpcMap: make(map[string]*rpcMethod),
-		group:  new(sync.WaitGroup),
-		mode:   MODE_BALANCED,
+		rpcMap:   make(map[string]*rpcMethod),
+		group:    new(sync.WaitGroup),
+		mode:     MODE_BALANCED,
 		exchange: exchange,
+		url:url,
 	}
 	rs.mContext, rs.cancel = context.WithCancel(context.Background())
-	rs.conn, err = amqp.Dial(url)
+	rs.conn, err = rs.connect()
 	if err != nil {
 		return nil, err
 	}
 	return rs, err
+}
+//
+func (s *RpcServer) reConnect() {
+	for {
+		conn, err := s.connect()
+		if err != nil {
+			fmt.Println(err)
+			<-time.After(time.Second * 3)
+			continue
+		}
+		log.Println("ReConnect success .....")
+		s.conn = conn
+		break
+	}
+	//update method register
+	for method, rm := range s.rpcMap {
+		rm.close()
+		s.Register(method,rm.method)
+	}
+
+}
+//
+func (s *RpcServer) connect() (*amqp.Connection, error) {
+	conn, err := amqp.Dial(s.url)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyClosed = make(chan *amqp.Error)
+	conn.NotifyClose(s.notifyClosed)
+	return conn, err
 }
 
 //
@@ -74,7 +107,7 @@ func (s *RpcServer) Register(method string, call interface{}) (err error) {
 	}
 	rm.method = call
 	s.rpcMap[method] = rm
-	if s.isRun(){
+	if s.isRun() {
 		s.group.Add(1)
 		go rm.run()
 	}
@@ -124,6 +157,7 @@ func (s *RpcServer) newRpcMethod(method string) (*rpcMethod, error) {
 func (s *RpcServer) isRun() bool {
 	return s.onRun
 }
+
 //
 func (s *RpcServer) Run() {
 	s.group.Add(1)
@@ -131,10 +165,20 @@ func (s *RpcServer) Run() {
 		s.group.Add(1)
 		go rm.run()
 	}
+	go s.closeListen()
 	s.onRun = true
 	s.group.Wait()
 }
 
+//
+func (s *RpcServer) closeListen() {
+	for {
+		select {
+		case <-s.notifyClosed:
+			s.reConnect()
+		}
+	}
+}
 //
 func (s *RpcServer) Close() {
 	if s.cancel != nil {
@@ -142,7 +186,7 @@ func (s *RpcServer) Close() {
 	}
 	//
 	for _, rm := range s.rpcMap {
-		if rm != nil{
+		if rm != nil {
 			rm.close()
 		}
 	}
@@ -152,6 +196,7 @@ func (s *RpcServer) Close() {
 		s.conn.Close()
 	}
 }
+
 //
 func (re *rpcMethod) close() {
 	if re.cancel != nil {
@@ -161,6 +206,7 @@ func (re *rpcMethod) close() {
 		re.channel.Close()
 	}
 }
+
 //
 func (re *rpcMethod) run() {
 	if re != nil && re.rpcServer != nil {
